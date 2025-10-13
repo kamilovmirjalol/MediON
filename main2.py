@@ -1,4 +1,4 @@
-# main2.py - MediON guided NSDR prototype (dashboard edition)
+# main.py - MediON guided NSDR prototype
 
 from machine import I2C, Pin
 from utime import sleep, ticks_ms, ticks_diff
@@ -23,7 +23,7 @@ BUTTON_PIN = 15
 HEADPHONE_PIN = 16
 HEADPHONE_CONNECTED_LEVEL = 1  # change to 0 if your jack pulls the line LOW when connected
 
-DEBUG = False
+DEBUG = True
 DEBUG_INTERVAL_MS = 600
 # Session parameters
 FINGER_IR_THRESHOLD = 8000
@@ -40,10 +40,16 @@ PLAYER_VOLUME = 24
 GYRO_AXIS = 'y'
 GYRO_MOVEMENT_THRESHOLD = 3.0
 MIN_BREATH_MOVEMENT_RATIO = 0.25
+BREATH_AXIS = 'y'
+BREATH_BASELINE_ALPHA = 0.05
+BREATH_FILTER_ALPHA = 0.5
+BREATH_STRENGTH_ALPHA = 0.2
+BREATH_ACTIVITY_THRESHOLD = 0.035
 
 IDLE_SAMPLE_DELAY = 0.12
 PPG_BATCH_READS = 12
 STALE_HR_TIMEOUT_MS = 8000
+DISPLAY_STALE_TIMEOUT_MS = STALE_HR_TIMEOUT_MS * 2
 IR_BASELINE_ALPHA = 0.97
 PEAK_RISE_TRIGGER = 120
 PEAK_FALL_RESET = 40
@@ -95,6 +101,13 @@ signal_envelope = 0.0
 last_dynamic_trigger = 0
 last_dynamic_fall = 0
 
+breath_baseline = None
+breath_signal = 0.0
+breath_strength = 0.0
+last_display_hr = None
+last_display_hrv = None
+last_display_update_ms = 0
+
 ir_baseline = 0.0
 peak_active = False
 
@@ -119,19 +132,27 @@ def headphones_connected():
 
 
 def refresh_hr_timeout():
-    global current_hr, current_hrv, current_hr_smooth
-    if current_hr is None:
-        return
+    global current_hr, current_hrv, current_hr_smooth, last_display_hr, last_display_hrv, last_display_update_ms
     if last_rr_update_ms == 0:
         return
-    if ticks_diff(ticks_ms(), last_rr_update_ms) > STALE_HR_TIMEOUT_MS:
+    now = ticks_ms()
+    age = ticks_diff(now, last_rr_update_ms)
+    if age > STALE_HR_TIMEOUT_MS:
         current_hr = None
-        current_hr_smooth = None
-        current_hrv = None
+        if age > STALE_HR_TIMEOUT_MS + 2000:
+            current_hr_smooth = None
+        if age > DISPLAY_STALE_TIMEOUT_MS:
+            last_display_hr = None
+            last_display_hrv = None
+    if last_display_update_ms:
+        display_age = ticks_diff(now, last_display_update_ms)
+        if display_age > DISPLAY_STALE_TIMEOUT_MS:
+            last_display_hr = None
+            last_display_hrv = None
 
 
 def reset_hr_processing():
-    global rr_samples, rr_window, current_hr, current_hrv, current_hr_smooth, last_rr_update_ms, last_peak_ms, ir_baseline, peak_active, signal_envelope, last_dynamic_trigger, last_dynamic_fall
+    global rr_samples, rr_window, current_hr, current_hrv, current_hr_smooth, last_rr_update_ms, last_peak_ms, ir_baseline, peak_active, signal_envelope, last_dynamic_trigger, last_dynamic_fall, breath_baseline, breath_signal, breath_strength, breath_direction, last_gyro_value
     rr_samples = []
     rr_window = []
     current_hr = None
@@ -144,10 +165,15 @@ def reset_hr_processing():
     signal_envelope = 0.0
     last_dynamic_trigger = 0
     last_dynamic_fall = 0
+    breath_baseline = None
+    breath_signal = 0.0
+    breath_strength = 0.0
+    breath_direction = "Stable"
+    last_gyro_value = 0.0
 
 
 def update_hr_state_from_ir(ir_value):
-    global last_ir_value, last_peak_ms, rr_samples, rr_window, current_hr, current_hrv, current_hr_smooth, last_rr_update_ms, ir_baseline, peak_active, last_signal_value, prev_signal_value, signal_envelope, last_dynamic_trigger, last_dynamic_fall
+    global last_ir_value, last_peak_ms, rr_samples, rr_window, current_hr, current_hrv, current_hr_smooth, last_rr_update_ms, ir_baseline, peak_active, last_signal_value, prev_signal_value, signal_envelope, last_dynamic_trigger, last_dynamic_fall, last_display_hr, last_display_hrv, last_display_update_ms
     if ir_value is None:
         return
     now = ticks_ms()
@@ -162,12 +188,12 @@ def update_hr_state_from_ir(ir_value):
         ir_baseline = (IR_BASELINE_ALPHA * ir_baseline) + ((1.0 - IR_BASELINE_ALPHA) * ir_value)
     prev_signal_value = last_signal_value
     signal = ir_value - ir_baseline
+    last_signal_value = signal
     signal_envelope = (signal_envelope * 0.9) + (abs(signal) * 0.1)
     dynamic_trigger = max(PEAK_RISE_TRIGGER, int(signal_envelope * PEAK_DYNAMIC_FACTOR))
     dynamic_fall = max(PEAK_FALL_RESET, int(dynamic_trigger * FALL_RATIO))
     last_dynamic_trigger = dynamic_trigger
     last_dynamic_fall = dynamic_fall
-    last_signal_value = signal
     rising = signal >= (prev_signal_value - RISE_HYSTERESIS)
     if not peak_active and signal >= dynamic_trigger and rising:
         if last_peak_ms is not None:
@@ -178,11 +204,13 @@ def update_hr_state_from_ir(ir_value):
                 rr = interval / 1000.0
                 rr_samples.append(rr)
                 rr_window.append(rr)
-                if len(rr_window) > 12:
-                    rr_window.pop(0)
                 if len(rr_samples) > 16:
                     rr_samples.pop(0)
-                current_hr = int(60.0 / rr)
+                if len(rr_window) > 12:
+                    rr_window.pop(0)
+                recent = rr_window[-3:] if len(rr_window) >= 3 else rr_window
+                avg_rr = sum(recent) / len(recent)
+                current_hr = int(60.0 / avg_rr)
                 if current_hr_smooth is None:
                     current_hr_smooth = current_hr
                 else:
@@ -193,16 +221,15 @@ def update_hr_state_from_ir(ir_value):
                     mean = sum(rr_window) / len(rr_window)
                     var = sum((x - mean) * (x - mean) for x in rr_window) / len(rr_window)
                     current_hrv = int((var ** 0.5) * 1000.0)
-                else:
-                    current_hrv = None
+                    last_display_hrv = current_hrv
+                last_display_hr = current_hr
+                last_display_update_ms = now
                 last_rr_update_ms = now
         last_peak_ms = now
         peak_active = True
     elif peak_active and signal <= dynamic_fall:
         peak_active = False
     last_ir_value = ir_value
-
-
 def pull_sensor_sample(max_reads=PPG_BATCH_READS):
     global last_debug_print_ms
     red_val = None
@@ -232,9 +259,10 @@ def pull_sensor_sample(max_reads=PPG_BATCH_READS):
         if last_debug_print_ms == 0 or ticks_diff(now, last_debug_print_ms) >= DEBUG_INTERVAL_MS:
             hp_level = headphone_pin.value() if headphone_pin else "n/a"
             hp_connected = headphones_connected()
-            hr_value = current_hr_smooth if current_hr_smooth is not None else current_hr
+            hr_value = current_hr_smooth if current_hr_smooth is not None else (current_hr if current_hr is not None else last_display_hr)
             hr_display = hr_value if hr_value is not None else "--"
-            hrv_display = current_hrv if current_hrv is not None else "--"
+            hrv_value = current_hrv if current_hrv is not None else last_display_hrv
+            hrv_display = hrv_value if hrv_value is not None else "--"
             finger_state = finger_on_sensor(ir_val)
             print("[DBG] IR:{} base:{} signal:{} dyn:{} fall:{} finger:{} HR:{} HRV:{} HP_level:{} HP_connected:{}".format(
                   ir_val if ir_val is not None else "None",
@@ -257,22 +285,30 @@ def finger_on_sensor(ir_value):
     return ir_value >= FINGER_IR_THRESHOLD
 
 
+
 def detect_breath_motion():
-    global breath_direction, last_gyro_value
+    global breath_direction, last_gyro_value, breath_baseline, breath_signal, breath_strength
     try:
-        gyro = imu.get_gyro_data()
-        value = gyro.get(GYRO_AXIS, 0.0)
+        accel = imu.get_accel_data(g=True)
+        value = accel.get(BREATH_AXIS, 0.0)
     except Exception:
         value = 0.0
-    last_gyro_value = value
-    moved = abs(value) >= GYRO_MOVEMENT_THRESHOLD
-    if value >= GYRO_MOVEMENT_THRESHOLD:
+    if breath_baseline is None:
+        breath_baseline = value
+    breath_baseline += BREATH_BASELINE_ALPHA * (value - breath_baseline)
+    delta = value - breath_baseline
+    breath_signal += BREATH_FILTER_ALPHA * (delta - breath_signal)
+    amplitude = abs(breath_signal)
+    last_gyro_value = amplitude
+    breath_strength += BREATH_STRENGTH_ALPHA * (amplitude - breath_strength)
+    moved = amplitude >= BREATH_ACTIVITY_THRESHOLD
+    if breath_signal > BREATH_ACTIVITY_THRESHOLD:
         breath_direction = "Expand"
-    elif value <= -GYRO_MOVEMENT_THRESHOLD:
+    elif breath_signal < -BREATH_ACTIVITY_THRESHOLD:
         breath_direction = "Lower"
     else:
         breath_direction = "Stable"
-    return moved, breath_direction, value
+    return moved, breath_direction, breath_strength
 
 
 def compose_warning_line(finger_ok, headphone_ok):
@@ -284,42 +320,39 @@ def compose_warning_line(finger_ok, headphone_ok):
     return " ".join(warnings)
 
 
-def render_status(stage="", detail="", warning=""):
+def render_status(header="", detail="", warning=""):
     refresh_hr_timeout()
     oled.fill(0)
-
     hr_value = current_hr_smooth if current_hr_smooth is not None else current_hr
+    if hr_value is None and last_display_hr is not None:
+        hr_value = last_display_hr
     hr_str = "--" if hr_value is None else "{:3d}".format(hr_value)
-    oled.text("Heart " + (hr_str.strip() + " bpm" if hr_value is not None else "--"), 0, 0)
+    hrv_value = current_hrv if current_hrv is not None else last_display_hrv
+    hrv_str = "--" if hrv_value is None else "{:3d}".format(hrv_value)
+    line0 = "HR:{0} HRV:{1}".format(hr_str, hrv_str)
+    oled.text(line0[:16], 0, 0)
 
-    hrv_str = "--" if current_hrv is None else "{:3d}".format(current_hrv)
-    oled.text("Calm " + (hrv_str.strip() + " ms" if current_hrv is not None else "--"), 0, 12)
+    abd = ("Breath: " + breath_direction)[:16]
+    oled.text(abd, 0, 12)
 
-    finger_ok = finger_on_sensor(last_ir_value)
-    hp_ok = headphones_connected()
-    status_text = "Finger ready" if finger_ok else "Place finger"
-    audio_text = "Audio ready" if hp_ok else "Plug headphones"
-    oled.text(status_text[:16], 0, 26)
-    oled.text(audio_text[:16], 0, 38)
-
-    if stage:
-        oled.text(stage[:16], 0, 50)
-        if len(stage) > 16:
-            oled.text(stage[16:32][:16], 0, 58)
+    if header:
+        oled.text(header[:16], 0, 24)
+        if len(header) > 16:
+            oled.text(header[16:32][:16], 0, 36)
+            if detail:
+                oled.text(detail[:16], 0, 48)
+        elif detail:
+            oled.text(detail[:16], 0, 36)
     elif detail:
-        oled.text(detail[:16], 0, 50)
-        if len(detail) > 16:
-            oled.text(detail[16:32][:16], 0, 58)
+        oled.text(detail[:16], 0, 24)
 
-    footer = warning
-    if not footer and skip_notice and ticks_diff(skip_notice_expires, ticks_ms()) > 0:
-        footer = skip_notice
-    if footer and not stage and not detail:
-        oled.text(footer[:16], 0, 50)
-    elif footer and (stage or detail):
-        oled.text(footer[:16], 0, 58)
-
+    now = ticks_ms()
+    if skip_notice and ticks_diff(skip_notice_expires, now) > 0:
+        oled.text(skip_notice[:16], 0, 56)
+    elif warning:
+        oled.text(warning[:16], 0, 56)
     oled.show()
+
 
 def read_button_event():
     if button.value() == 0:
@@ -406,17 +439,19 @@ def ensure_intro_track():
 
 
 def metrics_calm():
-    hr_value = current_hr_smooth if current_hr_smooth is not None else current_hr
-    if hr_value is None or current_hrv is None:
+    hr_value = current_hr_smooth if current_hr_smooth is not None else (current_hr if current_hr is not None else last_display_hr)
+    hrv_value = current_hrv if current_hrv is not None else last_display_hrv
+    if hr_value is None or hrv_value is None:
         return False
-    return hr_value <= HR_CALM and current_hrv >= HRV_CALM_MS
+    return hr_value <= HR_CALM and hrv_value >= HRV_CALM_MS
 
 
 def end_condition_met():
-    hr_value = current_hr_smooth if current_hr_smooth is not None else current_hr
-    if hr_value is None or current_hrv is None:
+    hr_value = current_hr_smooth if current_hr_smooth is not None else (current_hr if current_hr is not None else last_display_hr)
+    hrv_value = current_hrv if current_hrv is not None else last_display_hrv
+    if hr_value is None or hrv_value is None:
         return False
-    return hr_value <= HR_END and current_hrv >= HRV_END_MS
+    return hr_value <= HR_END and hrv_value >= HRV_END_MS
 
 
 def handle_breath_retries():
