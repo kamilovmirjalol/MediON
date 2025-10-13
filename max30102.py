@@ -21,14 +21,26 @@ REG_LED2_PA = 0x0D
 REG_PILOT_PA = 0x10
 
 class MAX30102:
-    def __init__(self, i2c_bus=0, sda=0, scl=1):
+    def __init__(self, i2c=None, i2c_bus=0, sda=0, scl=1):
+        """
+        Initialize MAX30102.
+        Accepts either a shared I2C object via `i2c` or will create a new one
+        using `i2c_bus`, `sda`, `scl` (for MicroPython on Pico).
+        """
         # Initialize I2C
-        self.i2c = I2C(i2c_bus, sda=Pin(sda), scl=Pin(scl), freq=400000)
+        if i2c is not None:
+            self.i2c = i2c
+        else:
+            self.i2c = I2C(i2c_bus, sda=Pin(sda), scl=Pin(scl), freq=400000)
         self.address = MAX30102_ADDR
 
-        self.reset()
-        sleep(1)
-        self.setup()
+        try:
+            self.reset()
+            sleep(1)
+            self.setup()
+        except Exception:
+            # Allow caller to handle init failures gracefully
+            raise
 
     # --- Low-level I2C helpers ---
     def write_reg(self, reg, val):

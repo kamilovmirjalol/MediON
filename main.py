@@ -1,600 +1,487 @@
-# main.py - MediON guided NSDR prototype
+"""
+main.py
+-------
+MediON stress data collection runtime for Raspberry Pi Pico / Pico W.
 
-from machine import I2C, Pin
-from utime import sleep, ticks_ms, ticks_diff
+Collects PPG (MAX30102) and accelerometer (MPU6050) samples, derives features
+in 60 s windows (with 30 s stride), logs CSV rows, and optionally evaluates a
+compact Random Forest model to trigger DFPlayer alerts. Label inputs come from
+an active-low button or console commands.
+"""
 
-from ssd1306 import SSD1306_I2C
-from dfplayer import DFPlayer
-from max30102 import MAX30102
-from mpu6050 import mpu6050
+import json
+import math
+import sys
+import time
 
-# Hardware pins and comms
-I2C_ID = 0
-I2C_SDA = 0
-I2C_SCL = 1
-I2C_FREQ = 400000
+try:
+    import uselect
+except ImportError:
+    uselect = None
+
+from machine import I2C, Pin, UART
+
+from sensors import Sensors
+from logging_utils import (
+    CSVLogger,
+    isoformat_from_epoch,
+    isoformat_from_uptime,
+)
+from rf_runtime import RandomForestRuntime
+
+try:
+    from dfplayer import DFPlayer
+except ImportError:  # pragma: no cover
+    DFPlayer = None  # type: ignore
+
+# -------------------------------------------------------------------- constants
+CONFIG_PATH = "config.json"
+DEFAULT_CONFIG = {
+    "ALERT_THRESH": 0.6,
+    "MIN_ALERT_GAP_SEC": 120,
+    "MOTION_THRESH_G": 0.15,
+    "BASELINE": {
+        "hr_mean": None,
+        "hr_std": None,
+        "rr_rmssd": None,
+        "rr_rmssd_std": None,
+    },
+}
+
+WINDOW_MS = 60_000
+WINDOW_STEP_MS = 30_000
+LABEL_ACTIVE_MS = 120_000
+PPG_POLL_MS = 20
+ACC_POLL_MS = 20
+BUTTON_PIN = 14
+BUTTON_DEBOUNCE_MS = 40
+BUTTON_LONG_MS = 1500
 
 UART_ID = 1
 UART_TX = 4
 UART_RX = 5
 DFPLAYER_BUSY_PIN = 17
 
-BUTTON_PIN = 15
-HEADPHONE_PIN = 16
-HEADPHONE_CONNECTED_LEVEL = 1  # change to 0 if your jack pulls the line LOW when connected
 
-DEBUG = True
-DEBUG_INTERVAL_MS = 600
-# Session parameters
-FINGER_IR_THRESHOLD = 8000
-HR_CALM = 75
-HRV_CALM_MS = 50
-HR_END = 68
-HRV_END_MS = 80
-MAX_BREATH_RETRIES = 3
-SESSION_MAX_CYCLES = 2
-LONG_PRESS_MS = 2000
-READY_HOLD_MS = 1500
-PLAYER_VOLUME = 24
-
-GYRO_AXIS = 'y'
-GYRO_MOVEMENT_THRESHOLD = 3.0
-MIN_BREATH_MOVEMENT_RATIO = 0.25
-BREATH_AXIS = 'y'
-BREATH_BASELINE_ALPHA = 0.05
-BREATH_FILTER_ALPHA = 0.5
-BREATH_STRENGTH_ALPHA = 0.2
-BREATH_ACTIVITY_THRESHOLD = 0.035
-
-IDLE_SAMPLE_DELAY = 0.12
-PPG_BATCH_READS = 12
-STALE_HR_TIMEOUT_MS = 8000
-DISPLAY_STALE_TIMEOUT_MS = STALE_HR_TIMEOUT_MS * 2
-IR_BASELINE_ALPHA = 0.97
-PEAK_RISE_TRIGGER = 120
-PEAK_FALL_RESET = 40
-MIN_BEAT_INTERVAL_MS = 320
-MAX_BEAT_INTERVAL_MS = 2000
-RISE_HYSTERESIS = 40
-PEAK_DYNAMIC_FACTOR = 0.45
-FALL_RATIO = 0.35
-
-# Hardware setup
-i2c = I2C(I2C_ID, sda=Pin(I2C_SDA), scl=Pin(I2C_SCL), freq=I2C_FREQ)
-oled = SSD1306_I2C(128, 64, i2c)
-
-player = DFPlayer(uartInstance=UART_ID, txPin=UART_TX, rxPin=UART_RX, busyPin=DFPLAYER_BUSY_PIN)
-sleep(0.2)
-player.setVolume(PLAYER_VOLUME)
-
-spo2 = MAX30102(i2c_bus=I2C_ID, sda=I2C_SDA, scl=I2C_SCL)
-sleep(0.2)
-
-imu = mpu6050(i2c)
-
-button = Pin(BUTTON_PIN, Pin.IN, Pin.PULL_UP)
-
-try:
-    headphone_pin = Pin(HEADPHONE_PIN, Pin.IN, Pin.PULL_UP)
-except Exception:
-    headphone_pin = None
-
-# State variables
-last_ir_value = 0
-last_peak_ms = None
-rr_samples = []
-rr_window = []
-current_hr = None
-current_hr_smooth = None
-current_hrv = None
-last_rr_update_ms = 0
-
-breath_direction = "Stable"
-last_gyro_value = 0.0
-
-skip_notice = ""
-skip_notice_expires = 0
-last_debug_print_ms = 0
-last_signal_value = 0.0
-prev_signal_value = 0.0
-signal_envelope = 0.0
-last_dynamic_trigger = 0
-last_dynamic_fall = 0
-
-breath_baseline = None
-breath_signal = 0.0
-breath_strength = 0.0
-last_display_hr = None
-last_display_hrv = None
-last_display_update_ms = 0
-
-ir_baseline = 0.0
-peak_active = False
-
-
-def clear_skip_notice():
-    global skip_notice, skip_notice_expires
-    skip_notice = ""
-    skip_notice_expires = 0
-
-
-def set_skip_notice(text, duration_ms=2500):
-    global skip_notice, skip_notice_expires
-    skip_notice = text
-    skip_notice_expires = ticks_ms() + duration_ms
-
-
-def headphones_connected():
-    if headphone_pin is None:
-        return True
-    level = headphone_pin.value()
-    return level == HEADPHONE_CONNECTED_LEVEL
-
-
-def refresh_hr_timeout():
-    global current_hr, current_hrv, current_hr_smooth, last_display_hr, last_display_hrv, last_display_update_ms
-    if last_rr_update_ms == 0:
-        return
-    now = ticks_ms()
-    age = ticks_diff(now, last_rr_update_ms)
-    if age > STALE_HR_TIMEOUT_MS:
-        current_hr = None
-        if age > STALE_HR_TIMEOUT_MS + 2000:
-            current_hr_smooth = None
-        if age > DISPLAY_STALE_TIMEOUT_MS:
-            last_display_hr = None
-            last_display_hrv = None
-    if last_display_update_ms:
-        display_age = ticks_diff(now, last_display_update_ms)
-        if display_age > DISPLAY_STALE_TIMEOUT_MS:
-            last_display_hr = None
-            last_display_hrv = None
-
-
-def reset_hr_processing():
-    global rr_samples, rr_window, current_hr, current_hrv, current_hr_smooth, last_rr_update_ms, last_peak_ms, ir_baseline, peak_active, signal_envelope, last_dynamic_trigger, last_dynamic_fall, breath_baseline, breath_signal, breath_strength, breath_direction, last_gyro_value
-    rr_samples = []
-    rr_window = []
-    current_hr = None
-    current_hr_smooth = None
-    current_hrv = None
-    last_rr_update_ms = 0
-    last_peak_ms = None
-    ir_baseline = 0.0
-    peak_active = False
-    signal_envelope = 0.0
-    last_dynamic_trigger = 0
-    last_dynamic_fall = 0
-    breath_baseline = None
-    breath_signal = 0.0
-    breath_strength = 0.0
-    breath_direction = "Stable"
-    last_gyro_value = 0.0
-
-
-def update_hr_state_from_ir(ir_value):
-    global last_ir_value, last_peak_ms, rr_samples, rr_window, current_hr, current_hrv, current_hr_smooth, last_rr_update_ms, ir_baseline, peak_active, last_signal_value, prev_signal_value, signal_envelope, last_dynamic_trigger, last_dynamic_fall, last_display_hr, last_display_hrv, last_display_update_ms
-    if ir_value is None:
-        return
-    now = ticks_ms()
-    finger_present = ir_value >= FINGER_IR_THRESHOLD
-    if not finger_present:
-        reset_hr_processing()
-        last_ir_value = ir_value
-        return
-    if ir_baseline == 0.0:
-        ir_baseline = float(ir_value)
-    else:
-        ir_baseline = (IR_BASELINE_ALPHA * ir_baseline) + ((1.0 - IR_BASELINE_ALPHA) * ir_value)
-    prev_signal_value = last_signal_value
-    signal = ir_value - ir_baseline
-    last_signal_value = signal
-    signal_envelope = (signal_envelope * 0.9) + (abs(signal) * 0.1)
-    dynamic_trigger = max(PEAK_RISE_TRIGGER, int(signal_envelope * PEAK_DYNAMIC_FACTOR))
-    dynamic_fall = max(PEAK_FALL_RESET, int(dynamic_trigger * FALL_RATIO))
-    last_dynamic_trigger = dynamic_trigger
-    last_dynamic_fall = dynamic_fall
-    rising = signal >= (prev_signal_value - RISE_HYSTERESIS)
-    if not peak_active and signal >= dynamic_trigger and rising:
-        if last_peak_ms is not None:
-            interval = ticks_diff(now, last_peak_ms)
-            if MIN_BEAT_INTERVAL_MS <= interval <= MAX_BEAT_INTERVAL_MS:
-                if DEBUG:
-                    print("[BEAT_CANDIDATE] signal:{} interval:{} ms".format(int(signal), interval))
-                rr = interval / 1000.0
-                rr_samples.append(rr)
-                rr_window.append(rr)
-                if len(rr_samples) > 16:
-                    rr_samples.pop(0)
-                if len(rr_window) > 12:
-                    rr_window.pop(0)
-                recent = rr_window[-3:] if len(rr_window) >= 3 else rr_window
-                avg_rr = sum(recent) / len(recent)
-                current_hr = int(60.0 / avg_rr)
-                if current_hr_smooth is None:
-                    current_hr_smooth = current_hr
-                else:
-                    current_hr_smooth = int((current_hr_smooth * 0.7) + (current_hr * 0.3))
-                if DEBUG:
-                    print("[BEAT] interval_ms:{} HR:{}".format(int(interval), current_hr))
-                if len(rr_window) >= 3:
-                    mean = sum(rr_window) / len(rr_window)
-                    var = sum((x - mean) * (x - mean) for x in rr_window) / len(rr_window)
-                    current_hrv = int((var ** 0.5) * 1000.0)
-                    last_display_hrv = current_hrv
-                last_display_hr = current_hr
-                last_display_update_ms = now
-                last_rr_update_ms = now
-        last_peak_ms = now
-        peak_active = True
-    elif peak_active and signal <= dynamic_fall:
-        peak_active = False
-    last_ir_value = ir_value
-def pull_sensor_sample(max_reads=PPG_BATCH_READS):
-    global last_debug_print_ms
-    red_val = None
-    ir_val = None
-    reads = 0
-    while reads < max_reads:
-        try:
-            remaining = spo2.get_data_present()
-        except Exception:
-            remaining = 1 if reads == 0 else 0
-        if remaining <= 0:
-            if reads == 0:
-                remaining = 1
-            else:
-                break
-        try:
-            red, ir = spo2.read_fifo()
-        except Exception:
-            break
-        update_hr_state_from_ir(ir)
-        red_val, ir_val = red, ir
-        reads += 1
-        if remaining <= 1:
-            break
-    if DEBUG:
-        now = ticks_ms()
-        if last_debug_print_ms == 0 or ticks_diff(now, last_debug_print_ms) >= DEBUG_INTERVAL_MS:
-            hp_level = headphone_pin.value() if headphone_pin else "n/a"
-            hp_connected = headphones_connected()
-            hr_value = current_hr_smooth if current_hr_smooth is not None else (current_hr if current_hr is not None else last_display_hr)
-            hr_display = hr_value if hr_value is not None else "--"
-            hrv_value = current_hrv if current_hrv is not None else last_display_hrv
-            hrv_display = hrv_value if hrv_value is not None else "--"
-            finger_state = finger_on_sensor(ir_val)
-            print("[DBG] IR:{} base:{} signal:{} dyn:{} fall:{} finger:{} HR:{} HRV:{} HP_level:{} HP_connected:{}".format(
-                  ir_val if ir_val is not None else "None",
-                  int(ir_baseline) if ir_baseline else 0,
-                  int(last_signal_value),
-                  last_dynamic_trigger,
-                  last_dynamic_fall,
-                  finger_state,
-                  hr_display,
-                  hrv_display,
-                  hp_level,
-                  hp_connected))
-            last_debug_print_ms = now
-    return red_val, ir_val
-
-
-def finger_on_sensor(ir_value):
-    if ir_value is None:
-        return False
-    return ir_value >= FINGER_IR_THRESHOLD
-
-
-
-def detect_breath_motion():
-    global breath_direction, last_gyro_value, breath_baseline, breath_signal, breath_strength
+# --------------------------------------------------------------------- utilities
+def ticks_ms():
     try:
-        accel = imu.get_accel_data(g=True)
-        value = accel.get(BREATH_AXIS, 0.0)
+        return time.ticks_ms()
+    except AttributeError:  # pragma: no cover
+        return int(time.time() * 1000)
+
+
+def ticks_diff(a, b):
+    try:
+        return time.ticks_diff(a, b)
+    except AttributeError:  # pragma: no cover
+        return a - b
+
+
+def ticks_add(value, delta):
+    try:
+        return time.ticks_add(value, delta)
+    except AttributeError:  # pragma: no cover
+        return value + delta
+
+
+def rtc_available():
+    try:
+        return time.localtime()[0] >= 2020
     except Exception:
-        value = 0.0
-    if breath_baseline is None:
-        breath_baseline = value
-    breath_baseline += BREATH_BASELINE_ALPHA * (value - breath_baseline)
-    delta = value - breath_baseline
-    breath_signal += BREATH_FILTER_ALPHA * (delta - breath_signal)
-    amplitude = abs(breath_signal)
-    last_gyro_value = amplitude
-    breath_strength += BREATH_STRENGTH_ALPHA * (amplitude - breath_strength)
-    moved = amplitude >= BREATH_ACTIVITY_THRESHOLD
-    if breath_signal > BREATH_ACTIVITY_THRESHOLD:
-        breath_direction = "Expand"
-    elif breath_signal < -BREATH_ACTIVITY_THRESHOLD:
-        breath_direction = "Lower"
-    else:
-        breath_direction = "Stable"
-    return moved, breath_direction, breath_strength
-
-
-def compose_warning_line(finger_ok, headphone_ok):
-    warnings = []
-    if not finger_ok:
-        warnings.append("Finger?")
-    if not headphone_ok:
-        warnings.append("Plug HP")
-    return " ".join(warnings)
-
-
-def render_status(header="", detail="", warning=""):
-    refresh_hr_timeout()
-    oled.fill(0)
-    hr_value = current_hr_smooth if current_hr_smooth is not None else current_hr
-    if hr_value is None and last_display_hr is not None:
-        hr_value = last_display_hr
-    hr_str = "--" if hr_value is None else "{:3d}".format(hr_value)
-    hrv_value = current_hrv if current_hrv is not None else last_display_hrv
-    hrv_str = "--" if hrv_value is None else "{:3d}".format(hrv_value)
-    line0 = "HR:{0} HRV:{1}".format(hr_str, hrv_str)
-    oled.text(line0[:16], 0, 0)
-
-    abd = ("Breath: " + breath_direction)[:16]
-    oled.text(abd, 0, 12)
-
-    if header:
-        oled.text(header[:16], 0, 24)
-        if len(header) > 16:
-            oled.text(header[16:32][:16], 0, 36)
-            if detail:
-                oled.text(detail[:16], 0, 48)
-        elif detail:
-            oled.text(detail[:16], 0, 36)
-    elif detail:
-        oled.text(detail[:16], 0, 24)
-
-    now = ticks_ms()
-    if skip_notice and ticks_diff(skip_notice_expires, now) > 0:
-        oled.text(skip_notice[:16], 0, 56)
-    elif warning:
-        oled.text(warning[:16], 0, 56)
-    oled.show()
-
-
-def read_button_event():
-    if button.value() == 0:
-        start = ticks_ms()
-        while button.value() == 0:
-            if ticks_diff(ticks_ms(), start) >= LONG_PRESS_MS:
-                while button.value() == 0:
-                    sleep(0.02)
-                return False, True
-            sleep(0.02)
-        return True, False
-    return False, False
-
-
-def movement_ratio(hits, samples):
-    if samples <= 0:
-        return 0.0
-    return hits / samples
-
-
-def monitor_idle(duration_ms, header="", detail=""):
-    start = ticks_ms()
-    while ticks_diff(ticks_ms(), start) < duration_ms:
-        _, ir = pull_sensor_sample()
-        detect_breath_motion()
-        finger_ok = finger_on_sensor(ir)
-        headphone_ok = headphones_connected()
-        warning = compose_warning_line(finger_ok, headphone_ok)
-        render_status(header, detail, warning)
-        short, long_press = read_button_event()
-        if long_press:
-            set_skip_notice("Session stopped")
-            return 'stop'
-        if short:
-            set_skip_notice("Button noted")
-        sleep(IDLE_SAMPLE_DELAY)
-    return 'ok'
-
-
-def play_and_monitor(track, header="", detail="", monitor_breath=False, allow_skip=True):
-    movement_samples = 0
-    movement_hits = 0
-    player.playRoot(track)
-    while True:
-        _, ir = pull_sensor_sample()
-        moved, _, _ = detect_breath_motion()
-        finger_ok = finger_on_sensor(ir)
-        headphone_ok = headphones_connected()
-        if monitor_breath:
-            movement_samples += 1
-            if moved:
-                movement_hits += 1
-        warning = compose_warning_line(finger_ok, headphone_ok)
-        render_status(header, detail, warning)
-        short, long_press = read_button_event()
-        if long_press:
-            player.stop()
-            set_skip_notice("Session stopped")
-            return 'stopped', movement_ratio(movement_hits, movement_samples)
-        if short:
-            if allow_skip:
-                player.stop()
-                set_skip_notice("Skipped %04d" % track)
-                return 'skipped', movement_ratio(movement_hits, movement_samples)
-            else:
-                set_skip_notice("Track %04d locked" % track)
-        busy = player.queryBusy()
-        if busy is None:
-            sleep(0.1)
-        else:
-            if not busy:
-                break
-        sleep(0.05)
-    return 'done', movement_ratio(movement_hits, movement_samples)
-
-
-def ensure_intro_track():
-    while True:
-        status, _ = play_and_monitor(1, "Introduction", "Track 0001", monitor_breath=False, allow_skip=False)
-        if status == 'stopped':
-            return 'stopped'
-        if status == 'done':
-            return 'done'
-
-
-def metrics_calm():
-    hr_value = current_hr_smooth if current_hr_smooth is not None else (current_hr if current_hr is not None else last_display_hr)
-    hrv_value = current_hrv if current_hrv is not None else last_display_hrv
-    if hr_value is None or hrv_value is None:
         return False
-    return hr_value <= HR_CALM and hrv_value >= HRV_CALM_MS
 
 
-def end_condition_met():
-    hr_value = current_hr_smooth if current_hr_smooth is not None else (current_hr if current_hr is not None else last_display_hr)
-    hrv_value = current_hrv if current_hrv is not None else last_display_hrv
-    if hr_value is None or hrv_value is None:
-        return False
-    return hr_value <= HR_END and hrv_value >= HRV_END_MS
+def default_config():
+    return json.loads(json.dumps(DEFAULT_CONFIG))
 
 
-def handle_breath_retries():
-    attempt = 0
-    while attempt < MAX_BREATH_RETRIES:
-        attempt += 1
-        header = "Breathing pattern"
-        detail = "Track 0003 (%d/%d)" % (attempt, MAX_BREATH_RETRIES)
-        status, ratio = play_and_monitor(3, header, detail, monitor_breath=True)
-        if status == 'stopped':
-            return 'stopped'
-        if ratio < MIN_BREATH_MOVEMENT_RATIO:
-            set_skip_notice("Expand your belly")
-            status_move, _ = play_and_monitor(5, "Expand the belly", "Track 0005")
-            if status_move == 'stopped':
-                return 'stopped'
-        result = monitor_idle(2000, "Checking calm", "Hold steady")
-        if result == 'stop':
-            return 'stopped'
-        if metrics_calm():
-            confirm_status, _ = play_and_monitor(4, "Breathe normally", "Track 0004")
-            if confirm_status == 'stopped':
-                return 'stopped'
-            return 'calm'
-    return 'not_calm'
-
-
-def muscle_focus_stage():
-    status_back, _ = play_and_monitor(6, "Relax your back", "Track 0006")
-    if status_back == 'stopped':
-        return 'stopped'
-    status_face, _ = play_and_monitor(7, "Relax your face", "Track 0007")
-    if status_face == 'stopped':
-        return 'stopped'
-    return 'done'
-
-
-def wait_for_ready():
-    clear_skip_notice()
-    hold_since = None
-    while True:
-        _, ir = pull_sensor_sample()
-        detect_breath_motion()
-        finger_ok = finger_on_sensor(ir)
-        headphone_ok = headphones_connected()
-        if finger_ok and headphone_ok:
-            if hold_since is None:
-                hold_since = ticks_ms()
-            header = "All sensors ready"
-            detail = "Starting shortly"
-            if ticks_diff(ticks_ms(), hold_since) >= READY_HOLD_MS:
-                return
-        else:
-            hold_since = None
-            if not finger_ok and not headphone_ok:
-                header = "Place finger &"
-                detail = "connect headphones"
-            elif not finger_ok:
-                header = "Place finger on"
-                detail = "the sensor"
-            else:
-                header = "Plug headphones"
-                detail = "to begin"
-        warning = compose_warning_line(finger_ok, headphone_ok)
-        render_status("Welcome MediON", header, warning)
-        short, long_press = read_button_event()
-        if long_press:
-            set_skip_notice("Hold released")
-        elif short and finger_ok and headphone_ok:
-            return
-        sleep(0.15)
-
-
-def final_relaxation_check():
-    result = monitor_idle(2000, "Settling", "Evaluating calm")
-    if result == 'stop':
-        return 'stopped'
-    if end_condition_met() or metrics_calm():
-        status, _ = play_and_monitor(8, "Closing meditation", "Track 0008", allow_skip=False)
-        if status == 'stopped':
-            return 'stopped'
-        return 'done'
-    return 'continue'
-
-
-def end_session(message):
-    player.stop()
-    clear_skip_notice()
-    render_status(message, "Thank you", "")
-    sleep(1.5)
-    oled.fill(0)
-    oled.text("MediON ready", 0, 0)
-    oled.show()
-
-
-def run_session():
-    wait_for_ready()
-    status = ensure_intro_track()
-    if status == 'stopped':
-        end_session("Session stopped")
-        return
-    final_message = "Session ended"
-    cycle = 0
-    while cycle < SESSION_MAX_CYCLES:
-        cycle += 1
-        result = monitor_idle(1500, "Collecting HR", "Preparing next")
-        if result == 'stop':
-            final_message = "Session stopped"
-            break
-        if metrics_calm():
-            status, _ = play_and_monitor(2, "Body sensations", "Track 0002")
-            if status == 'stopped':
-                final_message = "Session stopped"
-                break
-        else:
-            breath_result = handle_breath_retries()
-            if breath_result == 'stopped':
-                final_message = "Session stopped"
-                break
-            if breath_result == 'not_calm':
-                set_skip_notice("Continuing guidance")
-        muscle_result = muscle_focus_stage()
-        if muscle_result == 'stopped':
-            final_message = "Session stopped"
-            break
-        end_status = final_relaxation_check()
-        if end_status == 'stopped':
-            final_message = "Session stopped"
-            break
-        if end_status == 'done':
-            final_message = "Session complete"
-            break
-        render_status("Continuing support", "Another cycle", "")
-        sleep(0.8)
-    end_session(final_message)
-
-
-def main():
-    run_session()
-
-
-if __name__ == "__main__":
+def load_config():
     try:
-        main()
-    except KeyboardInterrupt:
-        end_session("Session stopped")
+        with open(CONFIG_PATH) as fp:
+            cfg = json.load(fp)
+    except OSError:
+        cfg = default_config()
+        save_config(cfg)
+        return cfg
+    except ValueError:
+        cfg = default_config()
+        save_config(cfg)
+        return cfg
+
+    # Ensure defaults
+    for key, value in DEFAULT_CONFIG.items():
+        if key not in cfg:
+            cfg[key] = default_config()[key] if isinstance(value, dict) else value
+    if "BASELINE" not in cfg or not isinstance(cfg["BASELINE"], dict):
+        cfg["BASELINE"] = default_config()["BASELINE"]
+    else:
+        for k, v in DEFAULT_CONFIG["BASELINE"].items():
+            cfg["BASELINE"].setdefault(k, v)
+    return cfg
+
+
+def save_config(cfg):
+    try:
+        with open(CONFIG_PATH, "w") as fp:
+            json.dump(cfg, fp)
+    except OSError:
+        pass
+
+
+def init_dfplayer():
+    if DFPlayer is None:
+        return None
+    try:
+        player = DFPlayer(uartInstance=UART_ID, txPin=UART_TX, rxPin=UART_RX, busyPin=DFPLAYER_BUSY_PIN)
+        return player
+    except Exception:
+        return None
+
+
+def play_alert(dfplayer, volume=24):
+    if dfplayer is None:
+        return False
+    try:
+        if hasattr(dfplayer, "setVolume"):
+            dfplayer.setVolume(volume)
+        busy = dfplayer.queryBusy() if hasattr(dfplayer, "queryBusy") else False
+        if busy:
+            return False
+        dfplayer.playRoot(1)
+        return True
+    except Exception:
+        return False
+
+
+def make_feature_vector(ppg_feats, motion_feats, hour_sin, hour_cos, hr_z, rr_z):
+    return {
+        "hr_mean": ppg_feats["hr_mean"],
+        "hr_std": ppg_feats["hr_std"],
+        "rr_rmssd": ppg_feats["rr_rmssd"],
+        "acdc_ratio": ppg_feats["acdc_ratio"],
+        "ppg_sqi": ppg_feats["ppg_sqi"],
+        "beat_count": ppg_feats["beat_count"],
+        "acc_var": motion_feats["acc_var"],
+        "motion_frac": motion_feats["motion_frac"],
+        "hour_sin": hour_sin,
+        "hour_cos": hour_cos,
+        "hr_z": hr_z,
+        "rr_rmssd_z": rr_z,
+    }
+
+
+def resolve_label(events, window_mid_ms):
+    for evt in reversed(events):
+        dt = ticks_diff(window_mid_ms, evt["ts"])
+        if dt < 0:
+            continue
+        if dt <= LABEL_ACTIVE_MS:
+            return evt["value"], evt["source"]
+    return -1, "na"
+
+
+def cleanup_events(events, cutoff_ms):
+    while events and ticks_diff(cutoff_ms, events[0]["ts"]) > (LABEL_ACTIVE_MS * 2):
+        events.pop(0)
+
+
+def recompute_baseline(window_history, now_uptime_ms, config):
+    lookback_ms = 5 * 60_000
+    cutoff = now_uptime_ms - lookback_ms
+    values_hr = []
+    values_rr = []
+    for w in window_history:
+        if w["end_uptime_ms"] < cutoff:
+            continue
+        if w["dropped_by_qc"]:
+            continue
+        if w["label"] != 0:
+            continue
+        values_hr.append(w["hr_mean"])
+        values_rr.append(w["rr_rmssd"])
+
+    if not values_hr or not values_rr:
+        print("[BASELINE] Not enough calm QC windows in last 5 min.")
+        return False
+
+    def mean_std(arr):
+        mean = sum(arr) / len(arr)
+        if len(arr) < 2:
+            std = 1.0
+        else:
+            std = math.sqrt(sum((x - mean) ** 2 for x in arr) / (len(arr) - 1))
+            if std < 1e-3:
+                std = 1.0
+        return mean, std
+
+    hr_mean, hr_std = mean_std(values_hr)
+    rr_mean, rr_std = mean_std(values_rr)
+
+    baseline = config.setdefault("BASELINE", {})
+    baseline["hr_mean"] = hr_mean
+    baseline["hr_std"] = hr_std
+    baseline["rr_rmssd"] = rr_mean
+    baseline["rr_rmssd_std"] = rr_std
+    save_config(config)
+    print("[BASELINE] Updated baseline: hr_mean={:.1f}, hr_std={:.2f}, rr_rmssd={:.1f}, rr_std={:.2f}".format(
+        hr_mean, hr_std, rr_mean, rr_std
+    ))
+    return True
+
+
+# --------------------------------------------------------------------- main run
+def main():
+    boot_ticks = ticks_ms()
+    config = load_config()
+
+    print("[BOOT] Init I2C0 @400kHz")
+    i2c = I2C(0, sda=Pin(0), scl=Pin(1), freq=400000)
+    try:
+        found = i2c.scan()
+    except Exception:
+        found = []
+    print("[BOOT] I2C scan:", found)
+
+    sensors = Sensors(i2c)
+    print("[BOOT] Init MAX30102:", "OK" if sensors.has_ppg else "FAIL")
+    if not sensors.has_ppg and sensors._last_ppg_error:
+        print("[ERROR] MAX30102:", sensors._last_ppg_error)
+    print("[BOOT] Init MPU6050:", "OK" if sensors.has_imu else "FAIL")
+    if not sensors.has_imu and sensors._last_imu_error:
+        print("[ERROR] MPU6050:", sensors._last_imu_error)
+
+    dfplayer = init_dfplayer()
+    print("[BOOT] Init DFPlayer:", "OK" if dfplayer else "FAIL")
+
+    rf_model = RandomForestRuntime()
+    rf_model.load()
+
+    csv_logger = CSVLogger()
+    log_path = csv_logger.current_path or "logs/unknown.csv"
+    print("[SESSION] Logging to {}".format(log_path))
+
+    button = Pin(BUTTON_PIN, Pin.IN, Pin.PULL_UP)
+    last_button_state = button.value()
+    last_button_change = ticks_ms()
+    press_start = None
+
+    if uselect and hasattr(uselect, "poll"):
+        poller = uselect.poll()
+        try:
+            poller.register(sys.stdin, uselect.POLLIN)
+        except Exception:
+            poller = None
+    else:
+        poller = None
+
+    label_events = []
+    window_history = []
+    last_prob = None
+    last_alert_ms = - (config.get("MIN_ALERT_GAP_SEC", 120) * 1000)
+
+    ppg_poll_due = ticks_ms()
+    acc_poll_due = ticks_ms()
+    next_window_due = ticks_add(ticks_ms(), WINDOW_STEP_MS)
+
+    while True:
+        now_ticks = ticks_ms()
+        uptime_ms = ticks_diff(now_ticks, boot_ticks)
+
+        # --------- PPG sampling
+        if ticks_diff(now_ticks, ppg_poll_due) >= 0:
+            # Drain as many samples as available this cycle.
+            drained = False
+            while True:
+                sample = sensors.read_ppg_sample()
+                if sample is None:
+                    break
+                sensors.feed_ppg(sample)
+                drained = True
+            ppg_poll_due = ticks_add(ppg_poll_due if drained else now_ticks, PPG_POLL_MS)
+
+        # --------- Accel sampling
+        if ticks_diff(now_ticks, acc_poll_due) >= 0:
+            acc = sensors.read_acc_sample()
+            if acc is not None:
+                sensors.feed_acc(*acc)
+            acc_poll_due = ticks_add(acc_poll_due, ACC_POLL_MS)
+
+        # --------- Button handling (active-low)
+        state = button.value()
+        if state != last_button_state:
+            if ticks_diff(now_ticks, last_button_change) >= BUTTON_DEBOUNCE_MS:
+                last_button_change = now_ticks
+                last_button_state = state
+                if state == 0:
+                    press_start = now_ticks
+                else:
+                    if press_start is not None:
+                        duration = ticks_diff(now_ticks, press_start)
+                        if duration < BUTTON_LONG_MS:
+                            label_events.append({"ts": now_ticks, "value": 1, "source": "btn"})
+                            print("[LABEL] Stressed (button short press)")
+                        else:
+                            label_events.append({"ts": now_ticks, "value": 0, "source": "btn"})
+                            print("[LABEL] Calm (button long press)")
+                        press_start = None
+                        cleanup_events(label_events, now_ticks)
+
+        # --------- Console commands
+        if poller is not None:
+            try:
+                events = poller.poll(0)
+            except Exception:
+                events = None
+                poller = None
+            if events:
+                try:
+                    cmd = sys.stdin.read(1)
+                except Exception:
+                    cmd = None
+                if cmd:
+                    cmd = cmd.strip().lower()
+                    if cmd == "s":
+                        label_events.append({"ts": now_ticks, "value": 1, "source": "cmd"})
+                        print("[LABEL] Simulated stressed")
+                    elif cmd == "c":
+                        label_events.append({"ts": now_ticks, "value": 0, "source": "cmd"})
+                        print("[LABEL] Simulated calm")
+                    elif cmd == "b":
+                        recompute_baseline(window_history, uptime_ms, config)
+                    elif cmd == "?":
+                        print("[CONFIG]", config)
+                        if last_prob is not None:
+                            print("[STATE] Last prob={:.3f}".format(last_prob.get("prob", 0.0)))
+                        else:
+                            print("[STATE] No predictions yet.")
+                    cleanup_events(label_events, now_ticks)
+
+        # --------- Window processing
+        if ticks_diff(now_ticks, next_window_due) >= 0:
+            window_end_ticks = now_ticks
+            window_start_ticks = ticks_add(window_end_ticks, -WINDOW_MS)
+            window_mid_ticks = ticks_add(window_start_ticks, WINDOW_MS // 2)
+
+            ppg_feats = sensors.get_ppg_features()
+            motion_feats = sensors.get_motion_features(config.get("MOTION_THRESH_G", 0.15))
+
+            rtc = rtc_available()
+            if rtc:
+                end_epoch = time.time()
+                start_epoch = end_epoch - (WINDOW_MS / 1000.0)
+                ts_start = isoformat_from_epoch(int(start_epoch))
+                ts_end = isoformat_from_epoch(int(end_epoch))
+                end_local = time.localtime()
+                hour = end_local[3] + end_local[4] / 60.0
+                angle = (hour / 24.0) * 2 * math.pi
+                hour_sin = math.sin(angle)
+                hour_cos = math.cos(angle)
+            else:
+                end_uptime = uptime_ms / 1000.0
+                start_uptime = end_uptime - (WINDOW_MS / 1000.0)
+                ts_start = isoformat_from_uptime(start_uptime)
+                ts_end = isoformat_from_uptime(end_uptime)
+                hour_sin, hour_cos = 0.0, 1.0
+
+            baseline = config.get("BASELINE", {})
+            hr_z = 0.0
+            rr_z = 0.0
+            if baseline.get("hr_mean") is not None and baseline.get("hr_std"):
+                denom = baseline["hr_std"]
+                hr_z = (ppg_feats["hr_mean"] - baseline["hr_mean"]) / denom if denom else 0.0
+            if baseline.get("rr_rmssd") is not None and baseline.get("rr_rmssd_std"):
+                denom = baseline["rr_rmssd_std"]
+                rr_z = (ppg_feats["rr_rmssd"] - baseline["rr_rmssd"]) / denom if denom else 0.0
+
+            feature_row = make_feature_vector(ppg_feats, motion_feats, hour_sin, hour_cos, hr_z, rr_z)
+
+            label_value, label_src = resolve_label(label_events, window_mid_ticks)
+            dropped_by_qc = 0
+            if not sensors.has_ppg:
+                dropped_by_qc = 1
+            if ppg_feats["beat_count"] < 30 or ppg_feats["ppg_sqi"] < 0.8:
+                dropped_by_qc = 1
+            if motion_feats["motion_frac"] > 0.3:
+                dropped_by_qc = 1
+            if motion_feats["sample_count"] < 10:
+                dropped_by_qc = 1
+
+            stress_prob = ""
+            alert_flag = ""
+            prob_value = None
+            if dropped_by_qc == 0:
+                prob = rf_model.predict_proba(feature_row)
+                if prob is not None:
+                    prob_value = prob
+                    stress_prob = "{:.3f}".format(prob)
+                    last_prob = {"prob": prob, "ts": ts_end}
+                    gap_ms = config.get("MIN_ALERT_GAP_SEC", 120) * 1000
+                    if prob >= config.get("ALERT_THRESH", 0.6) and ticks_diff(now_ticks, last_alert_ms) >= gap_ms:
+                        fired = play_alert(dfplayer)
+                        if fired:
+                            last_alert_ms = now_ticks
+                        alert_flag = "1" if fired else "0"
+                    else:
+                        alert_flag = "0"
+                else:
+                    stress_prob = ""
+                    alert_flag = ""
+            else:
+                prob_value = None
+                alert_flag = ""
+
+            row = [
+                ts_start,
+                ts_end,
+                "{:.3f}".format(ppg_feats["hr_mean"]),
+                "{:.3f}".format(ppg_feats["hr_std"]),
+                "{:.3f}".format(ppg_feats["rr_rmssd"]),
+                "{:.5f}".format(ppg_feats["acdc_ratio"]),
+                "{:.3f}".format(ppg_feats["ppg_sqi"]),
+                str(ppg_feats["beat_count"]),
+                "{:.5f}".format(motion_feats["acc_var"]),
+                "{:.3f}".format(motion_feats["motion_frac"]),
+                "{:.5f}".format(hour_sin),
+                "{:.5f}".format(hour_cos),
+                "{:.3f}".format(hr_z),
+                "{:.3f}".format(rr_z),
+                str(label_value),
+                label_src,
+                str(dropped_by_qc),
+                stress_prob,
+                alert_flag,
+            ]
+
+            csv_logger.append(row)
+
+            print("[WIN] ts={} HR={:.1f} RMSSD={:.1f} SQI={:.2f} MOTION={:.2f} QC={} label={} prob={} alert={}".format(
+                ts_end,
+                ppg_feats["hr_mean"],
+                ppg_feats["rr_rmssd"],
+                ppg_feats["ppg_sqi"],
+                motion_feats["motion_frac"],
+                dropped_by_qc,
+                label_value,
+                stress_prob or "NA",
+                alert_flag or "0",
+            ))
+
+            window_history.append({
+                "end_uptime_ms": uptime_ms,
+                "hr_mean": ppg_feats["hr_mean"],
+                "rr_rmssd": ppg_feats["rr_rmssd"],
+                "dropped_by_qc": dropped_by_qc,
+                "label": label_value,
+            })
+            if len(window_history) > 240:
+                window_history.pop(0)
+
+            next_window_due = ticks_add(next_window_due, WINDOW_STEP_MS)
+
+        # Let other tasks run
+        time.sleep_ms(5)
+
+
+if __name__ == "__main__":  # pragma: no cover
+    main()
