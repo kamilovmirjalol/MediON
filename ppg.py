@@ -22,7 +22,9 @@ HR_SHORT_HRV_S          = 30        # short HRV window for sdnn30/rmssd30
 
 # UI: beat indicator
 BEAT_LED_MS             = 140
-MIN_INTERVAL_MS         = 300
+MIN_INTERVAL_MS         = 450
+BEAT_REL_THRESHOLD      = 0.65
+BEAT_MIN_PROMINENCE     = 0.02
 
 # --- Original simple IIR band-pass that detector was tuned for ---
 class BandPassFilter:
@@ -383,7 +385,12 @@ class PPGProcessor:
             prom = c - min(self.signal_buffer)
             amp = max(self.signal_buffer) - min(self.signal_buffer)
             rel = (prom / amp) if amp > 0 else 0.0
-            if is_peak and interval_ms > MIN_INTERVAL_MS and rel > 0.5:
+            if (
+                is_peak
+                and interval_ms > MIN_INTERVAL_MS
+                and rel > BEAT_REL_THRESHOLD
+                and prom > BEAT_MIN_PROMINENCE
+            ):
                 self.last_beat_time = now_ms
                 self.beat_led_until = now_ms + BEAT_LED_MS
                 self.bpm_inst = 60000.0 / interval_ms

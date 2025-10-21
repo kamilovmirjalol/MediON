@@ -33,13 +33,29 @@ def load_model_head(path="model_rf.json", log_fn=print):
         with open(path, "r") as f:
             data = f.read()
         head = json.loads(data)
-        for k in ("features", "n_estimators", "decision_threshold"):
+        # Backward/forward compatibility for different exporters
+        # Normalize threshold key
+        if "decision_threshold" not in head:
+            if "threshold" in head:
+                head["decision_threshold"] = head.get("threshold")
+            else:
+                head["decision_threshold"] = 0.5
+        # Normalize shard dir
+        if "shard_dir" not in head:
+            if "trees_path" in head:
+                head["shard_dir"] = head.get("trees_path")
+            else:
+                head["shard_dir"] = "trees_rf"
+        # Normalize tree pattern
+        if "tree_pattern" not in head:
+            head["tree_pattern"] = "tree_{:04d}.json"
+        # Mark sharded
+        if "sharded" not in head:
+            head["sharded"] = True
+        for k in ("features", "n_estimators"):
             if k not in head:
                 log_fn("model head missing key: {}".format(k))
                 return None
-        if "sharded" not in head or not head["sharded"]:
-            log_fn("model head is not sharded; export with sharding.")
-            return None
         return head
     except Exception as e:
         log_fn("load_model_head error: {}".format(e))
@@ -74,7 +90,25 @@ def _load_tree_nodes(path):
     with open(path, "r") as f:
         data = f.read()
     obj = json.loads(data)
-    return obj["nodes"]
+    # Accept packed nodes or scikit-style arrays
+    if "nodes" in obj:
+        return obj["nodes"]
+    if all(k in obj for k in ("children_left", "children_right", "feature", "threshold", "value_pos")):
+        cl = obj["children_left"]
+        cr = obj["children_right"]
+        feat = obj["feature"]
+        thr = obj["threshold"]
+        val = obj["value_pos"]
+        n = len(feat)
+        nodes = []
+        for i in range(n):
+            if feat[i] == -2:  # leaf
+                nodes.append([-1, float(val[i])])
+            else:
+                nodes.append([int(feat[i]), float(thr[i]), int(cl[i]), int(cr[i])])
+        return nodes
+    # Unknown format
+    raise ValueError("unknown tree format: {}".format(path))
 
 class RFStreamer:
     """
@@ -87,7 +121,7 @@ class RFStreamer:
         self.mh = model_head
         self.n = int(model_head.get("n_estimators", 0))
         self.dir = shard_dir or model_head.get("shard_dir", "trees_rf")
-        self.patt = patt or model_head.get("tree_pattern", "tree_{:03d}.json")
+        self.patt = patt or model_head.get("tree_pattern", "tree_{:04d}.json")
         self.reset()
 
     def reset(self):
@@ -112,7 +146,7 @@ class RFStreamer:
         end = min(self._i + max_trees, self.n)
         for j in range(self._i, end):
             try:
-                path = "{}/{}".format(self.dir, self.mh.get("tree_pattern", "tree_{:03d}.json").format(j))
+                path = "{}/{}".format(self.dir, self.mh.get("tree_pattern", "tree_{:04d}.json").format(j))
                 nodes = _load_tree_nodes(path)
                 p = _tree_proba_packed(nodes, self._x)
                 self._acc += p
