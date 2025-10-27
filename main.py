@@ -39,7 +39,6 @@ HRV_CALM_MS = 50
 HR_END = 68
 HRV_END_MS = 80
 MAX_BREATH_RETRIES = 3
-SESSION_MAX_CYCLES = 2
 STRESS_HOLD_MS = 2000
 SESSION_STOP_HOLD_MS = 5000
 READY_HOLD_MS = 1500
@@ -56,6 +55,7 @@ BREATH_ACTIVITY_THRESHOLD = 0.035
 
 IDLE_SAMPLE_DELAY = 0.12
 PPG_BATCH_READS = 12
+PPG_MAX_BATCH_READS = 48  # upper bound used to drain FIFO faster when backlog builds up
 STALE_HR_TIMEOUT_MS = 8000
 DISPLAY_STALE_TIMEOUT_MS = STALE_HR_TIMEOUT_MS * 2
 # Legacy PPG detector constants above removed; using ppg.PPGProcessor
@@ -77,6 +77,11 @@ FEATURE_FIELDS = (
 FEATURE_WINDOW_MS = 300000  # 5 minute rolling window
 MODEL_WINDOW_MS = 15000     # short inference window (~15s) for instant ML updates
 RECORD_EVENT_WINDOW_MS = 120000  # 2-minute per-event recording window
+MEDITATION_DURATION_OPTIONS = (
+    (120000, "02:00"),
+    (300000, "05:00"),
+    (600000, "10:00"),
+)
 
 # Hardware setup
 i2c = I2C(I2C_ID, sda=Pin(I2C_SDA), scl=Pin(I2C_SCL), freq=I2C_FREQ)
@@ -118,9 +123,29 @@ breath_strength = 0.0
 last_display_hr = None
 last_display_hrv = None
 
+meditation_duration_ms = MEDITATION_DURATION_OPTIONS[1][0]
+meditation_end_ms = 0
+meditation_overlay = ""
+meditation_overlay_sub = ""
+
+# Display text tied directly to the track currently playing.
+TRACK_DISPLAY_LINES = {
+    1: ("Introduction",),
+    2: ("Relax muscles",),
+    3: ("Breathe in", "Pattern"),
+    4: ("Breath normally",),
+    5: ("Expand belly",),
+    6: ("Relax muscles",),
+    7: ("Relax muscles",),
+    8: ("The end",),
+}
+TRACK_FORCE_FULL_PLAY = {8}
+EXTRA_TRACKS = (5, 6, 7)
+
 last_bpm_update_ms = 0
 beat_led_until = 0
 ppg = None
+gc_pending_counter = 0
 
 # UI/mode control
 MODE = None  # 'record' or 'meditate'
@@ -139,13 +164,19 @@ ml_is_stress = None
 ml_threshold = 0.5
 ml_last_update_ms = 0
 ml_next_update_ms = 0
-ML_UPDATE_INTERVAL_MS = 800
+ML_UPDATE_INTERVAL_MS = 120
 ML_MIN_BEATS = 2
 ML_MIN_DURATION_S = 5.0
 ML_MIN_SQI = 0.20
 ml_feat_x = None
 ml_last_tree_i = -1
 ml_wait_last_print_ms = 0
+ML_STRESS_CONFIRM_MS = 4000
+ML_CALM_CONFIRM_MS = 2000
+ml_display_state = 'unknown'
+ml_display_prob = None
+ml_pending_state = None
+ml_pending_since = 0
 
 
 def init_ppg():
@@ -176,6 +207,80 @@ def init_ml():
 init_ml()
 
 
+def _randrange(limit):
+    if limit <= 0:
+        return 0
+    try:
+        val = os.urandom(1)[0]
+    except Exception:
+        val = ticks_ms() & 0xFF
+    return val % limit
+
+
+def _shuffle_extra_tracks():
+    tracks = list(EXTRA_TRACKS)
+    for idx in range(len(tracks) - 1, 0, -1):
+        swap = _randrange(idx + 1)
+        tracks[idx], tracks[swap] = tracks[swap], tracks[idx]
+    return tracks
+
+
+def set_meditation_overlay(text="", subtext=""):
+    global meditation_overlay, meditation_overlay_sub
+    meditation_overlay = text or ""
+    meditation_overlay_sub = subtext or ""
+
+
+def clear_meditation_overlay():
+    set_meditation_overlay("", "")
+
+
+def meditation_time_remaining_ms():
+    if meditation_end_ms <= 0:
+        return None
+    now = ticks_ms()
+    remain = ticks_diff(meditation_end_ms, now)
+    if remain < 0:
+        remain = 0
+    return remain
+
+
+def meditation_time_expired():
+    remain = meditation_time_remaining_ms()
+    return (remain is not None) and (remain == 0)
+
+
+def select_meditation_duration():
+    global meditation_duration_ms, meditation_end_ms
+    meditation_end_ms = 0
+    clear_meditation_overlay()
+    # start from current selection if possible
+    idx = 0
+    for i, (ms, _) in enumerate(MEDITATION_DURATION_OPTIONS):
+        if ms == meditation_duration_ms:
+            idx = i
+            break
+    while True:
+        oled.fill(0)
+        oled.text("Meditation time", 0, 0)
+        current = MEDITATION_DURATION_OPTIONS[idx]
+        oled.text(current[1], 0, 20)
+        oled.text("Short: cycle", 0, 40)
+        oled.text("Hold: start", 0, 52)
+        oled.show()
+        if button.value() == 0:
+            t0 = ticks_ms()
+            while button.value() == 0:
+                sleep(0.02)
+            held = ticks_diff(ticks_ms(), t0)
+            if held >= STRESS_HOLD_MS:
+                meditation_duration_ms = current[0]
+                return
+            else:
+                idx = (idx + 1) % len(MEDITATION_DURATION_OPTIONS)
+        sleep(0.05)
+
+
 def select_mode():
     global MODE, display_waveform, record_start_ms
     # UI prompt
@@ -203,9 +308,10 @@ def select_mode():
 
 
 def run_record_mode():
-    global MODE, display_waveform, record_start_ms
+    global MODE, display_waveform, record_start_ms, meditation_end_ms
     MODE = 'record'
     display_waveform = True
+    meditation_end_ms = 0
     # Minimal record UI loop; long-hold ends session
     while True:
         _, ir = pull_sensor_sample()
@@ -256,28 +362,15 @@ last_ir_value = 0
 def _ensure_csv_header():
     if not CSV_LOG_ENABLED:
         return
+    # Only write header when file is missing or empty; never rename or truncate.
+    size = 0
     try:
         st = os.stat(CSV_FILENAME)
-        size = st[6] if isinstance(st, (tuple, list)) and len(st) > 6 else 0
-        if size > 0:
-            # verify header matches expected format
-            try:
-                with open(CSV_FILENAME, "r") as fh:
-                    first = fh.readline().strip()
-                expected = "timestamp_ms,label," + ",".join(FEATURE_FIELDS)
-                if not first.startswith(expected):
-                    # rename legacy file and create new header
-                    try:
-                        os.rename(CSV_FILENAME, "events_legacy.csv")
-                    except Exception:
-                        pass
-                    size = 0
-                else:
-                    return
-            except Exception:
-                pass
+        size = st[6] if isinstance(st, (tuple, list)) and len(st) > 6 else (st[0] if isinstance(st, (tuple, list)) else 0)
     except OSError:
-        pass
+        size = 0
+    if size and size > 0:
+        return
     try:
         with open(CSV_FILENAME, "a") as f:
             header = "timestamp_ms,label," + ",".join(FEATURE_FIELDS) + "\n"
@@ -342,11 +435,13 @@ def refresh_hr_timeout():
 
 
 def reset_hr_processing():
-    global current_hr, current_hrv, current_hr_smooth, last_bpm_update_ms, breath_baseline, breath_signal, breath_strength, breath_direction, last_gyro_value, wave_buf, beat_led_until
+    global current_hr, current_hrv, current_hr_smooth, last_bpm_update_ms, breath_baseline, breath_signal, breath_strength, breath_direction, last_gyro_value, wave_buf, beat_led_until, last_display_hr, last_display_hrv
     current_hr = None
     current_hr_smooth = None
     current_hrv = None
     last_bpm_update_ms = 0
+    last_display_hr = None
+    last_display_hrv = None
     breath_baseline = None
     breath_signal = 0.0
     breath_strength = 0.0
@@ -358,7 +453,7 @@ def reset_hr_processing():
 
 # update_hr_state_from_ir removed; PPG handled by ppg.PPGProcessor
 def pull_sensor_sample(max_reads=PPG_BATCH_READS):
-    global last_debug_print_ms, last_red_value, last_ir_value, current_hr, current_hr_smooth, current_hrv, last_bpm_update_ms, wave_buf, last_display_hr, last_display_hrv, beat_led_until, ppg
+    global last_debug_print_ms, last_red_value, last_ir_value, current_hr, current_hr_smooth, current_hrv, last_bpm_update_ms, wave_buf, last_display_hr, last_display_hrv, beat_led_until, ppg, gc_pending_counter
     red_val = None
     ir_val = None
     reads = 0
@@ -367,6 +462,8 @@ def pull_sensor_sample(max_reads=PPG_BATCH_READS):
             remaining = spo2.get_data_present()
         except Exception:
             remaining = 1 if reads == 0 else 0
+        if remaining > 0 and (reads + remaining) > max_reads:
+            max_reads = min(PPG_MAX_BATCH_READS, reads + remaining)
         if remaining <= 0:
             if reads == 0:
                 remaining = 1
@@ -385,6 +482,11 @@ def pull_sensor_sample(max_reads=PPG_BATCH_READS):
             acc_vert_g = accel.get(BREATH_AXIS, 0.0)
         except Exception:
             acc_vert_g = 0.0
+        finger_present = finger_on_sensor(ir)
+        if not finger_present:
+            reset_hr_processing()
+            reads += 1
+            continue
         try:
             out = ppg.process_sample(now, ir, acc_vert_g, 0.0, 0.0)
         except MemoryError:
@@ -443,7 +545,10 @@ def pull_sensor_sample(max_reads=PPG_BATCH_READS):
                   hp_connected))
             last_debug_print_ms = now
     if reads:
-        gc.collect()
+        gc_pending_counter += 1
+        if gc_pending_counter >= 200:
+            gc.collect()
+            gc_pending_counter = 0
     return red_val, ir_val
 
 
@@ -549,12 +654,48 @@ def compose_warning_line(finger_ok, headphone_ok):
 
 
 def ml_decision():
-    """Return (decision, prob) using the last computed ML output if available.
-    Does not run inference; call ml_update_nonblocking() elsewhere to progress.
-    """
+    """Return (decision, prob) using a smoothed ML output when available."""
+    if ml_display_state in ('stress', 'calm') and ml_display_prob is not None:
+        return (ml_display_state, ml_display_prob)
     if ml_prob is None or ml_is_stress is None:
         return ('unknown', None)
     return ('stress' if ml_is_stress else 'calm'), ml_prob
+
+
+def _register_ml_output(prob):
+    """Apply hysteresis so short stress spikes do not flip the UI immediately."""
+    global ml_display_state, ml_display_prob, ml_pending_state, ml_pending_since
+    if prob is None:
+        return
+    now = ticks_ms()
+    raw_state = 'stress' if prob >= ml_threshold else 'calm'
+    if ml_display_state not in ('stress', 'calm'):
+        ml_display_state = raw_state
+        ml_display_prob = prob
+        ml_pending_state = None
+        ml_pending_since = 0
+        return
+    if raw_state == ml_display_state:
+        ml_display_prob = prob
+        ml_pending_state = None
+        ml_pending_since = 0
+        return
+    confirm_ms = ML_STRESS_CONFIRM_MS if raw_state == 'stress' else ML_CALM_CONFIRM_MS
+    if confirm_ms <= 0:
+        ml_display_state = raw_state
+        ml_display_prob = prob
+        ml_pending_state = None
+        ml_pending_since = 0
+        return
+    if ml_pending_state != raw_state:
+        ml_pending_state = raw_state
+        ml_pending_since = now
+        return
+    if ml_pending_since and ticks_diff(now, ml_pending_since) >= confirm_ms:
+        ml_display_state = raw_state
+        ml_display_prob = prob
+        ml_pending_state = None
+        ml_pending_since = 0
 
 
 def ml_update_nonblocking():
@@ -615,8 +756,8 @@ def ml_update_nonblocking():
                 try:
                     i = getattr(ml_stream, "_i", None)
                     n = getattr(ml_stream, "n", None)
-                    # print every 4 trees to reduce console overhead
-                    if (i is not None) and (n is not None) and (i != ml_last_tree_i) and (i % 4 == 0 or i == n):
+                    # print every 8 trees to reduce console overhead
+                    if (i is not None) and (n is not None) and (i != ml_last_tree_i) and (i % 8 == 0 or i == n):
                         print("[ML] trees {}/{}".format(i, n))
                         ml_last_tree_i = i
                 except Exception:
@@ -628,6 +769,7 @@ def ml_update_nonblocking():
                 prob = ml_stream.prob()
                 ml_prob = prob
                 ml_is_stress = (prob >= ml_threshold)
+                _register_ml_output(prob)
                 ml_last_update_ms = now
                 if DEBUG:
                     print("[ML] done {} prob={:.3f}".format(getattr(ml_stream, "n", 0), prob))
@@ -701,9 +843,7 @@ def tick_record_event_ui():
     set_skip_notice("Left %dm%02ds" % (mm, ss), 600)
 
 
-def render_status(header="", detail="", warning=""):
-    refresh_hr_timeout()
-    oled.fill(0)
+def _render_standard_display(header, detail, warning):
     hr_value = current_hr_smooth if current_hr_smooth is not None else current_hr
     if hr_value is None and last_display_hr is not None:
         hr_value = last_display_hr
@@ -714,16 +854,13 @@ def render_status(header="", detail="", warning=""):
     oled.text(line0[:16], 0, 0)
 
     if MODE == 'meditate':
-        # Show ML status instead of breath. Display confidence for the predicted class.
         label = "--"
         if ml_prob is not None and ml_is_stress is not None:
             conf = ml_prob if ml_is_stress else (1.0 - ml_prob)
             label = ("Stress" if ml_is_stress else "Calm") + " {0:.0f}%".format(conf*100)
         oled.text(("ML: " + label)[:16], 0, 12)
 
-    # Draw waveform area (auto-scaled)
-    # Also show in meditation to visualize responsiveness for debugging
-    show_wave = (MODE == 'record' and display_waveform) or (MODE == 'meditate')
+    show_wave = (MODE == 'record' and display_waveform)
     if show_wave:
         try:
             oled.fill_rect(0, WAVE_Y0, 128, WAVE_H, 0)
@@ -734,32 +871,28 @@ def render_status(header="", detail="", warning=""):
                 last_x = 0
                 last_y = WAVE_Y0 + (WAVE_H // 2)
                 n = len(wave_buf)
-                # Map up to 128 samples to screen width
                 for i in range(min(WAVE_W, n)):
                     x = i
                     val = wave_buf[n - min(WAVE_W, n) + i]
                     y = WAVE_Y0 + (WAVE_H - 1) - int(((val - vmin) / vrng) * (WAVE_H - 1))
-                    # draw line from last to current
                     try:
                         oled.line(last_x, last_y, x, y, 1)
                     except Exception:
-                        # fallback: set pixel
                         oled.pixel(x, y, 1)
                     last_x, last_y = x, y
         except Exception:
             pass
-
-    # Only draw header/detail when not showing waveform
-    if (not show_wave) and header:
-        oled.text(header[:16], 0, 24)
-        if len(header) > 16:
-            oled.text(header[16:32][:16], 0, 36)
-            if detail:
-                oled.text(detail[:16], 0, 48)
+    else:
+        if header:
+            oled.text(header[:16], 0, 24)
+            if len(header) > 16:
+                oled.text(header[16:32][:16], 0, 36)
+                if detail:
+                    oled.text(detail[:16], 0, 48)
+            elif detail:
+                oled.text(detail[:16], 0, 36)
         elif detail:
-            oled.text(detail[:16], 0, 36)
-    elif (not show_wave) and detail:
-        oled.text(detail[:16], 0, 24)
+            oled.text(detail[:16], 0, 24)
 
     now = ticks_ms()
     if beat_led_until and ticks_diff(beat_led_until, now) > 0:
@@ -769,6 +902,66 @@ def render_status(header="", detail="", warning=""):
         oled.text(skip_notice[:16], 0, 56)
     elif warning:
         oled.text(warning[:16], 0, 56)
+
+
+def _render_meditation_display(warning):
+    remain = meditation_time_remaining_ms()
+    if remain is None:
+        remain = 0
+    mm = remain // 60000
+    ss = (remain % 60000) // 1000
+    lines = ["Time {:02d}:{:02d}".format(mm, ss)]
+    decision, prob = ml_decision()
+    if decision == 'stress':
+        pct = int(min(max(prob or 0.0, 0.0), 1.0) * 100)
+        lines.append("Stress {0:3d}%".format(pct))
+    elif decision == 'calm':
+        conf = 1.0 - (prob or 0.0)
+        pct = int(min(max(conf, 0.0), 1.0) * 100)
+        lines.append("Calm {0:3d}%".format(pct))
+    else:
+        lines.append("Preparing")
+        lines.append("Stay relaxed")
+
+    overlay_lines = []
+    if meditation_overlay:
+        overlay_lines.append(meditation_overlay)
+        if meditation_overlay_sub:
+            overlay_lines.append(meditation_overlay_sub)
+
+    now = ticks_ms()
+    notice = None
+    if skip_notice and ticks_diff(skip_notice_expires, now) > 0:
+        notice = skip_notice
+    elif warning:
+        notice = warning
+
+    max_lines = 6
+    reserve = 1 if notice else 0
+    for extra in overlay_lines:
+        if len(lines) >= (max_lines - reserve):
+            break
+        lines.append(extra)
+
+    if notice:
+        if len(lines) >= max_lines:
+            lines[-1] = notice
+        else:
+            lines.append(notice)
+
+    for idx, text in enumerate(lines[:max_lines]):
+        if not text:
+            continue
+        oled.text(text[:16], 0, idx * 12)
+
+
+def render_status(header="", detail="", warning=""):
+    refresh_hr_timeout()
+    oled.fill(0)
+    if MODE == 'meditate' and meditation_end_ms > 0:
+        _render_meditation_display(warning)
+    else:
+        _render_standard_display(header, detail, warning)
     oled.show()
 
 
@@ -786,11 +979,17 @@ def read_button_event():
         if MODE == 'record':
             now_ms = ticks_ms()
             if event_in_progress:
-                # show remaining time; do not start a new event
+                # If event window has expired, finalize it immediately so a new event can start
                 remain = RECORD_EVENT_WINDOW_MS - ticks_diff(now_ms, event_start_ms)
-                if remain < 0: remain = 0
-                set_skip_notice("Left %dm%02ds" % (remain//60000, (remain%60000)//1000), 1500)
-                return True, False
+                if remain <= 0:
+                    try:
+                        finalize_current_event("auto")
+                    except Exception:
+                        pass
+                else:
+                    # show remaining time; do not start a new event yet
+                    set_skip_notice("Left %dm%02ds" % (remain//60000, (remain%60000)//1000), 1500)
+                    return True, False
             # Start an event depending on press length
             if hold_duration >= STRESS_HOLD_MS:
                 if start_record_event("stress"):
@@ -837,10 +1036,26 @@ def monitor_idle(duration_ms, header="", detail=""):
     return 'ok'
 
 
-def play_and_monitor(track, header="", detail="", monitor_breath=False, allow_skip=True):
+def play_and_monitor(track, header="", detail="", monitor_breath=False, allow_skip=True, respect_timer=True):
     movement_samples = 0
     movement_hits = 0
+    overlay_text = None
+    overlay_subtext = ""
+    track_lines = TRACK_DISPLAY_LINES.get(track)
+    if isinstance(track_lines, (tuple, list)):
+        if track_lines:
+            overlay_text = track_lines[0]
+            if len(track_lines) > 1:
+                overlay_subtext = track_lines[1]
+    elif track_lines:
+        overlay_text = str(track_lines)
+    overlay_active = False
+    if MODE == 'meditate' and overlay_text:
+        set_meditation_overlay(overlay_text, overlay_subtext)
+        overlay_active = True
     player.playRoot(track)
+    time_expired = False
+    timer_enforced = respect_timer and (track not in TRACK_FORCE_FULL_PLAY)
     while True:
         _, ir = pull_sensor_sample()
         if MODE == 'meditate':
@@ -848,6 +1063,10 @@ def play_and_monitor(track, header="", detail="", monitor_breath=False, allow_sk
                 ml_update_nonblocking()
             except Exception:
                 pass
+            if timer_enforced and meditation_end_ms > 0 and ticks_diff(meditation_end_ms, ticks_ms()) <= 0:
+                time_expired = True
+                player.stop()
+                break
         elif MODE == 'record':
             tick_record_event_ui()
         moved, _, _ = detect_breath_motion()
@@ -864,6 +1083,10 @@ def play_and_monitor(track, header="", detail="", monitor_breath=False, allow_sk
             player.stop()
             set_skip_notice("Session stopped")
             return 'stopped', movement_ratio(movement_hits, movement_samples)
+        if short and allow_skip:
+            player.stop()
+            set_skip_notice("Track skipped")
+            break
         busy = player.queryBusy()
         if busy is None:
             sleep(0.1)
@@ -871,87 +1094,66 @@ def play_and_monitor(track, header="", detail="", monitor_breath=False, allow_sk
             if not busy:
                 break
         sleep(0.05)
+    if overlay_active:
+        clear_meditation_overlay()
+    if time_expired:
+        return 'done', movement_ratio(movement_hits, movement_samples)
     return 'done', movement_ratio(movement_hits, movement_samples)
 
 
-def ensure_intro_track():
-    while True:
-        status, _ = play_and_monitor(1, "Introduction", "Track 0001", monitor_breath=False, allow_skip=False)
-        if status == 'stopped':
-            return 'stopped'
-        if status == 'done':
-            return 'done'
+def play_track(track, header, detail, monitor_breath=False):
+    """Wrapper to ensure meditation tracks always run to completion."""
+    return play_and_monitor(
+        track,
+        header,
+        detail,
+        monitor_breath=monitor_breath,
+        allow_skip=False,
+        respect_timer=False,
+    )
 
 
-def metrics_calm():
-    # ML primary (2-min window); heuristics fallback
+def need_breath_focus():
+    if MODE != 'meditate':
+        return False
     decision, _ = ml_decision()
-    if decision == 'calm':
-        return True
-    if decision == 'stress':
-        return False
-    # Fallback heuristics
-    hr_value = current_hr_smooth if current_hr_smooth is not None else (current_hr if current_hr is not None else last_display_hr)
-    if hr_value is None:
-        return False
-    if hr_value > 100:
-        return False
-    if 50 <= hr_value <= 100:
-        return True
-    # hr < 50 => treat as calm conservatively
-    return True
+    return decision == 'stress'
 
 
-def end_condition_met():
-    decision, _ = ml_decision()
-    if decision == 'calm':
-        return True
-    if decision == 'stress':
-        return False
-    # fallback heuristics
-    hr_value = current_hr_smooth if current_hr_smooth is not None else (current_hr if current_hr is not None else last_display_hr)
-    if hr_value is None:
-        return False
-    if hr_value > 100:
-        return False
-    if 50 <= hr_value <= 100:
-        return True
-    return True
-
-
-def handle_breath_retries():
+def run_breath_focus_sequence():
+    """Apply up to MAX_BREATH_RETRIES pattern cycles followed by track 0004."""
     attempt = 0
     while attempt < MAX_BREATH_RETRIES:
         attempt += 1
         header = "Breathing pattern"
-        detail = "Track 0003 (%d/%d)" % (attempt, MAX_BREATH_RETRIES)
-        status, ratio = play_and_monitor(3, header, detail, monitor_breath=True)
+        detail = "Track 0003 ({}/{})".format(attempt, MAX_BREATH_RETRIES)
+        status, ratio = play_track(3, header, detail, monitor_breath=True)
         if status == 'stopped':
             return 'stopped'
         if ratio < MIN_BREATH_MOVEMENT_RATIO:
-            set_skip_notice("Expand your belly")
-            status_move, _ = play_and_monitor(5, "Expand the belly", "Track 0005")
+            status_move, _ = play_track(5, "Expand the belly", "Track 0005")
             if status_move == 'stopped':
                 return 'stopped'
-        result = monitor_idle(2000, "Checking calm", "Hold steady")
-        if result == 'stop':
-            return 'stopped'
-        if metrics_calm():
-            confirm_status, _ = play_and_monitor(4, "Breathe normally", "Track 0004")
-            if confirm_status == 'stopped':
+        if not need_breath_focus():
+            status4, _ = play_track(4, "Breathe normally", "Track 0004")
+            if status4 == 'stopped':
                 return 'stopped'
             return 'calm'
-    return 'not_calm'
-
-
-def muscle_focus_stage():
-    status_back, _ = play_and_monitor(6, "Relax your back", "Track 0006")
-    if status_back == 'stopped':
-        return 'stopped'
-    status_face, _ = play_and_monitor(7, "Relax your face", "Track 0007")
-    if status_face == 'stopped':
+    status4, _ = play_track(4, "Breathe normally", "Track 0004")
+    if status4 == 'stopped':
         return 'stopped'
     return 'done'
+
+
+def ensure_breath_focus_if_needed():
+    """Check stress after an audio segment and prompt breathing focus once if needed."""
+    if MODE != 'meditate':
+        return 'ok'
+    if not need_breath_focus():
+        return 'ok'
+    return run_breath_focus_sequence()
+
+
 
 
 def wait_for_ready():
@@ -990,76 +1192,78 @@ def wait_for_ready():
         sleep(0.15)
 
 
-def final_relaxation_check():
-    result = monitor_idle(2000, "Settling", "Evaluating calm")
-    if result == 'stop':
-        return 'stopped'
-    if end_condition_met() or metrics_calm():
-        status, _ = play_and_monitor(8, "Closing meditation", "Track 0008", allow_skip=False)
-        if status == 'stopped':
-            return 'stopped'
-        return 'done'
-    return 'continue'
-
-
 def end_session(message):
+    global meditation_end_ms
+    _ = message
     player.stop()
     clear_skip_notice()
-    render_status(message, "Thank you", "")
-    sleep(1.5)
+    meditation_end_ms = 0
+    clear_meditation_overlay()
     oled.fill(0)
-    oled.text("MediON ready", 0, 0)
+    oled.text("Session ended.", 0, 0)
+    oled.text("Thank you.", 0, 12)
     oled.show()
+    sleep(1.5)
 
 
 def run_session():
+    global meditation_end_ms
     wait_for_ready()
-    status = ensure_intro_track()
+    meditation_end_ms = ticks_ms() + meditation_duration_ms
+
+    status, _ = play_track(1, "Introduction", "Track 0001")
     if status == 'stopped':
         end_session("Session stopped")
         return
-    final_message = "Session ended"
-    cycle = 0
-    while cycle < SESSION_MAX_CYCLES:
-        cycle += 1
-        result = monitor_idle(1500, "Collecting HR", "Preparing next")
-        if result == 'stop':
-            final_message = "Session stopped"
+    if ensure_breath_focus_if_needed() == 'stopped':
+        end_session("Session stopped")
+        return
+
+    status, _ = play_track(2, "Relax muscles", "Track 0002")
+    if status == 'stopped':
+        end_session("Session stopped")
+        return
+    if ensure_breath_focus_if_needed() == 'stopped':
+        end_session("Session stopped")
+        return
+
+    extras = _shuffle_extra_tracks()
+    extra_headers = {
+        5: "Expand the belly",
+        6: "Relax your back",
+        7: "Relax your face",
+    }
+    while True:
+        if meditation_time_expired():
             break
-        if metrics_calm():
-            status, _ = play_and_monitor(2, "Body sensations", "Track 0002")
-            if status == 'stopped':
-                final_message = "Session stopped"
-                break
-        else:
-            breath_result = handle_breath_retries()
-            if breath_result == 'stopped':
-                final_message = "Session stopped"
-                break
-            if breath_result == 'not_calm':
-                set_skip_notice("Continuing guidance")
-        muscle_result = muscle_focus_stage()
-        if muscle_result == 'stopped':
-            final_message = "Session stopped"
-            break
-        end_status = final_relaxation_check()
-        if end_status == 'stopped':
-            final_message = "Session stopped"
-            break
-        if end_status == 'done':
-            final_message = "Session complete"
-            break
-        render_status("Continuing support", "Another cycle", "")
-        sleep(0.8)
-    end_session(final_message)
+        if not extras:
+            extras = _shuffle_extra_tracks()
+        track = extras.pop(0)
+        header = extra_headers.get(track, "Guidance")
+        detail = "Track {0:04d}".format(track)
+        status, _ = play_track(track, header, detail)
+        if status == 'stopped':
+            end_session("Session stopped")
+            return
+        if ensure_breath_focus_if_needed() == 'stopped':
+            end_session("Session stopped")
+            return
+
+    status, _ = play_track(8, "Closing meditation", "Track 0008")
+    if status == 'stopped':
+        end_session("Session stopped")
+        return
+    end_session("Session complete")
 
 
 def main():
-    select = select_mode()
-    if select == 'record':
-        run_record_mode()
-    else:
-        run_session()
+    while True:
+        select = select_mode()
+        if select == 'record':
+            run_record_mode()
+        else:
+            select_meditation_duration()
+            run_session()
 
 
 if __name__ == "__main__":

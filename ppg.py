@@ -25,6 +25,7 @@ BEAT_LED_MS             = 140
 MIN_INTERVAL_MS         = 450
 BEAT_REL_THRESHOLD      = 0.65
 BEAT_MIN_PROMINENCE     = 0.02
+RR_BUFFER_MAX           = 240   # cap stored RR intervals (~2-4 minutes of beats)
 
 # --- Original simple IIR band-pass that detector was tuned for ---
 class BandPassFilter:
@@ -108,7 +109,7 @@ class BeatFeatureEngine:
         self.bt_t = []         # beat timestamps (ms)
         self.bt_amp = []       # amplitude per beat
         self.bt_rise_ms = []   # rise time per beat
-        self.bt_w50_ms = []    # width@50% per beat
+        self.bt_w50_ms = []    # width@50% per beat (aligned with bt_t; may contain None until measured)
         self._win = []
         self._last_peak_t = None
         self._pending_w50 = []
@@ -124,6 +125,7 @@ class BeatFeatureEngine:
             self.bt_t.pop(0)
             if self.bt_amp: self.bt_amp.pop(0)
             if self.bt_rise_ms: self.bt_rise_ms.pop(0)
+            # Keep lists aligned 1:1 with beats; width may be None for some beats
             if self.bt_w50_ms: self.bt_w50_ms.pop(0)
 
     def _register_peak(self, t_ms, peak_val):
@@ -140,7 +142,8 @@ class BeatFeatureEngine:
         amp = peak_val - vmin
         rise_ms = max(0, t_ms - t_min)
         th = vmin + 0.5 * amp
-        self._pending_w50.append({'th': th, 't_peak': t_ms, 't_cross': None})
+        pending = {'th': th, 't_peak': t_ms, 't_cross': None, 'beat_index': None}
+        self._pending_w50.append(pending)
         if self._last_peak_t is None:
             rr_ok = True
         else:
@@ -151,6 +154,9 @@ class BeatFeatureEngine:
             self.bt_t.append(t_ms)
             self.bt_amp.append(float(amp))
             self.bt_rise_ms.append(int(rise_ms))
+            # Reserve a slot for width@50% for this beat; will be filled on crossing
+            self.bt_w50_ms.append(None)
+            pending['beat_index'] = len(self.bt_t) - 1
 
     def _update_w50(self, t_ms, x):
         keep = []
@@ -159,8 +165,9 @@ class BeatFeatureEngine:
                 if x <= p['th']:
                     p['t_cross'] = t_ms
                     width = t_ms - p['t_peak']
-                    if self.bt_t and self.bt_t[-1] == p['t_peak']:
-                        self.bt_w50_ms.append(int(width))
+                    idx = p.get('beat_index')
+                    if idx is not None and 0 <= idx < len(self.bt_w50_ms):
+                        self.bt_w50_ms[idx] = int(width)
                 else:
                     if (t_ms - p['t_peak']) <= self._search_w50_ms:
                         keep.append(p)
@@ -246,12 +253,16 @@ class BeatFeatureEngine:
         sd2 = math.sqrt(sd2_sq) if sd2_sq > 0 else 0.0
         hr_mean = 60000.0 / mean_rr if mean_rr > 0 else 0.0
 
-        amps  = self.bt_amp[idx0:] if len(self.bt_amp)  >= len(self.bt_t) else []
-        rises = self.bt_rise_ms[idx0:] if len(self.bt_rise_ms) >= len(self.bt_t) else []
-        w50s  = self.bt_w50_ms[idx0:] if len(self.bt_w50_ms) >= len(self.bt_t) else []
+        # Slice arrays over the same time window; width list may include None for missing measurements
+        amps  = self.bt_amp[idx0:]
+        rises = self.bt_rise_ms[idx0:]
+        w50s_raw  = self.bt_w50_ms[idx0:]
+        # Filter out None before computing stats
+        w50s = [w for w in w50s_raw if isinstance(w, (int, float))]
 
         def mstats(arr):
-            if not arr: return (0.0, 0.0)
+            if not arr:
+                return (0.0, 0.0)
             m = sum(arr)/len(arr)
             v = sum((a-m)**2 for a in arr)/len(arr)
             return (m, math.sqrt(v))
@@ -399,6 +410,8 @@ class PPGProcessor:
                     if len(self.bpm_history) > 10: self.bpm_history.pop(0)
                     self.bpm_avg = sum(self.bpm_history) / len(self.bpm_history)
                     self.rr_intervals.append(interval_ms)
+                    if len(self.rr_intervals) > RR_BUFFER_MAX:
+                        self.rr_intervals.pop(0)
                     if len(self.rr_intervals) > 1:
                         mean_rr = sum(self.rr_intervals) / len(self.rr_intervals)
                         self.HRV = math.sqrt(sum((x - mean_rr) ** 2 for x in self.rr_intervals) / len(self.rr_intervals))

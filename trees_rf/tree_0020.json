@@ -1,1 +1,1 @@
-{"children_left": [-1], "children_right": [-1], "feature": [-2], "threshold": [-2.0], "value_pos": [0.0]}
+{"children_left": [1, -1, -1], "children_right": [2, -1, -1], "feature": [3, -2, -2], "threshold": [0.41210000216960907, -2.0, -2.0], "value_pos": [0.5273972602739728, 1.0, 0.0]}
