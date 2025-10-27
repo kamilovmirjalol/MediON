@@ -44,14 +44,14 @@ SESSION_STOP_HOLD_MS = 5000
 READY_HOLD_MS = 1500
 PLAYER_VOLUME = 24
 
-GYRO_AXIS = 'y'
+GYRO_AXIS = 'x'  # sensor mounted to read belly motion along X
 GYRO_MOVEMENT_THRESHOLD = 3.0
 MIN_BREATH_MOVEMENT_RATIO = 0.25
-BREATH_AXIS = 'y'
+BREATH_AXIS = 'x'  # accelerometer axis aligned with abdominal expansion
 BREATH_BASELINE_ALPHA = 0.05
 BREATH_FILTER_ALPHA = 0.5
 BREATH_STRENGTH_ALPHA = 0.2
-BREATH_ACTIVITY_THRESHOLD = 0.035
+BREATH_ACTIVITY_THRESHOLD = 0.02  # tuned for 2-5 cm abdominal expansion
 
 IDLE_SAMPLE_DELAY = 0.12
 PPG_BATCH_READS = 12
@@ -1124,21 +1124,33 @@ def run_breath_focus_sequence():
     """Apply up to MAX_BREATH_RETRIES pattern cycles followed by track 0004."""
     attempt = 0
     while attempt < MAX_BREATH_RETRIES:
+        if meditation_time_expired():
+            return 'done'
         attempt += 1
         header = "Breathing pattern"
         detail = "Track 0003 ({}/{})".format(attempt, MAX_BREATH_RETRIES)
         status, ratio = play_track(3, header, detail, monitor_breath=True)
         if status == 'stopped':
             return 'stopped'
+        if meditation_time_expired():
+            return 'done'
         if ratio < MIN_BREATH_MOVEMENT_RATIO:
+            if meditation_time_expired():
+                return 'done'
             status_move, _ = play_track(5, "Expand the belly", "Track 0005")
             if status_move == 'stopped':
                 return 'stopped'
+            if meditation_time_expired():
+                return 'done'
         if not need_breath_focus():
+            if meditation_time_expired():
+                return 'done'
             status4, _ = play_track(4, "Breathe normally", "Track 0004")
             if status4 == 'stopped':
                 return 'stopped'
             return 'calm'
+    if meditation_time_expired():
+        return 'done'
     status4, _ = play_track(4, "Breathe normally", "Track 0004")
     if status4 == 'stopped':
         return 'stopped'
@@ -1148,6 +1160,8 @@ def run_breath_focus_sequence():
 def ensure_breath_focus_if_needed():
     """Check stress after an audio segment and prompt breathing focus once if needed."""
     if MODE != 'meditate':
+        return 'ok'
+    if meditation_time_expired():
         return 'ok'
     if not need_breath_focus():
         return 'ok'

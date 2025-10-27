@@ -1,1 +1,21 @@
-{"type": "random_forest", "n_estimators": 32, "class_weight": "balanced", "features": ["mean_hr_bpm", "sdnn_ms", "rmssd_ms", "pnn20", "sd1_ms", "sd2_ms", "amp_mean", "rise_ms_mean", "width50_ms_mean"], "threshold": 0.2, "decision_threshold": 0.2, "trees_path": "trees_rf", "shard_dir": "trees_rf", "tree_pattern": "tree_{:04d}.json"}
+{
+    "type": "random_forest",
+    "n_estimators": 32,
+    "class_weight": "balanced",
+    "features": [
+        "mean_hr_bpm",
+        "sdnn_ms",
+        "rmssd_ms",
+        "pnn20",
+        "sd1_ms",
+        "sd2_ms",
+        "amp_mean",
+        "rise_ms_mean",
+        "width50_ms_mean"
+    ],
+    "threshold": 0.2,
+    "decision_threshold": 0.2,
+    "trees_path": "trees_rf",
+    "shard_dir": "trees_rf",
+    "tree_pattern": "tree_{:04d}.json"
+}
