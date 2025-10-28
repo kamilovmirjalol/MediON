@@ -52,6 +52,8 @@ BREATH_BASELINE_ALPHA = 0.05
 BREATH_FILTER_ALPHA = 0.5
 BREATH_STRENGTH_ALPHA = 0.2
 BREATH_ACTIVITY_THRESHOLD = 0.02  # tuned for 2-5 cm abdominal expansion
+PRE_TRACK_PAUSE_MS = 1500
+PRE_TRACK_PAUSE_EXEMPT = (1,)
 
 IDLE_SAMPLE_DELAY = 0.12
 PPG_BATCH_READS = 12
@@ -1053,6 +1055,12 @@ def play_and_monitor(track, header="", detail="", monitor_breath=False, allow_sk
     if MODE == 'meditate' and overlay_text:
         set_meditation_overlay(overlay_text, overlay_subtext)
         overlay_active = True
+    if PRE_TRACK_PAUSE_MS > 0 and track not in PRE_TRACK_PAUSE_EXEMPT:
+        pause_status = monitor_idle(PRE_TRACK_PAUSE_MS, header, detail)
+        if pause_status == 'stop':
+            if overlay_active:
+                clear_meditation_overlay()
+            return 'stopped', movement_ratio(movement_hits, movement_samples)
     player.playRoot(track)
     time_expired = False
     timer_enforced = respect_timer and (track not in TRACK_FORCE_FULL_PLAY)
@@ -1065,8 +1073,6 @@ def play_and_monitor(track, header="", detail="", monitor_breath=False, allow_sk
                 pass
             if timer_enforced and meditation_end_ms > 0 and ticks_diff(meditation_end_ms, ticks_ms()) <= 0:
                 time_expired = True
-                player.stop()
-                break
         elif MODE == 'record':
             tick_record_event_ui()
         moved, _, _ = detect_breath_motion()
