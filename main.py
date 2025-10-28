@@ -1,4 +1,4 @@
-# main.py - MediON guided NSDR prototype
+# main.py - rivr guided NSDR prototype
 
 from machine import I2C, Pin
 from utime import sleep, ticks_ms, ticks_diff
@@ -267,7 +267,7 @@ def select_meditation_duration():
         oled.text("Meditation time", 0, 0)
         current = MEDITATION_DURATION_OPTIONS[idx]
         oled.text(current[1], 0, 20)
-        oled.text("Short: cycle", 0, 40)
+        oled.text("Short: change", 0, 40)
         oled.text("Hold: start", 0, 52)
         oled.show()
         if button.value() == 0:
@@ -290,7 +290,7 @@ def select_mode():
         oled.fill(0)
         oled.text("Select Mode", 0, 0)
         oled.text("Short: Record", 0, 16)
-        oled.text("Hold: Meditate", 0, 32)
+        oled.text("Hold 4s:Meditate", 0, 32)
         oled.show()
         if button.value() == 0:
             t0 = ticks_ms()
@@ -1203,7 +1203,7 @@ def wait_for_ready():
                 header = "Plug headphones"
                 detail = "to begin"
         warning = compose_warning_line(finger_ok, headphone_ok)
-        render_status("Welcome MediON", header, warning)
+        render_status("Welcome back", header, warning)
         short, long_press = read_button_event()
         if long_press:
             set_skip_notice("Hold released")
